@@ -285,6 +285,10 @@ def _load_from_database():
         student_master = pd.read_sql("SELECT * FROM student_master", engine)
         subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
 
+        # DEBUG: Print raw DB column names before renaming
+        print("RAW DB COLUMNS student_master:", student_master.columns.tolist())
+        print("RAW DB COLUMNS subject_term:", subject_term.columns.tolist())
+
         # Rename database snake_case columns to match app's CSV-style column names
         # so all three data sources (demo, CSV, database) produce identical schemas
         student_master = student_master.rename(columns={
@@ -311,7 +315,7 @@ def _load_from_database():
         return None, None
 
 
-@st.cache_data
+# TEMPORARILY DISABLED FOR DEBUGGING: @st.cache_data
 def load_data():
     """
     Returns (student_master, subject_term, is_demo).
