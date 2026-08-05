@@ -36,7 +36,7 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "changeme123")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "3307"))   # 3307 matches local Docker; Aiven uses its own port
 DB_NAME = os.environ.get("DB_NAME", "school_analytics")
-DB_SSL_CA = os.environ.get("DB_SSL_CA")  # path to ca.pem -- required for Aiven, unset for local Docker
+DB_SSL_CA = os.environ.get("DB_SSL_CA")  # path to ca.pem relative to repo root (e.g. "certs/aiven-ca.pem") -- required for Aiven, unset for local Docker
 
 
 def _is_pct_col(s: pd.Series) -> bool:
@@ -135,7 +135,11 @@ def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame):
     if DB_SSL_CA:
         # Aiven (and most managed MySQL/MariaDB hosts) require SSL. pymysql
         # expects the CA cert path nested under a "ssl" dict.
-        connect_args["ssl"] = {"ca": DB_SSL_CA}
+        cert_path = Path(__file__).resolve().parent / DB_SSL_CA
+        if cert_path.exists():
+            connect_args["ssl"] = {"ca": str(cert_path)}
+        else:
+            print(f"Warning: SSL certificate not found at {cert_path}. Attempting connection without SSL.")
 
     engine = create_engine(conn_str, connect_args=connect_args)
 

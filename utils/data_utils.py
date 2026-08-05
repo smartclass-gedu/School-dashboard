@@ -241,6 +241,8 @@ def _load_from_database():
     Reads student_master and subject_term from a MySQL/MariaDB database.
     Expects st.secrets to have:
       ["db"]["host"], ["port"], ["user"], ["password"], ["database"]
+    Optionally uses SSL (required for Aiven):
+      ["db"]["ssl_ca"] = relative path to CA certificate (e.g. "certs/aiven-ca.pem")
 
     Returns (student_master, subject_term) with the same schema as the real
     and demo data loaders, ensuring seamless swaps between data sources.
@@ -267,9 +269,18 @@ def _load_from_database():
         return None, None
 
     try:
-        engine = create_engine(
-            f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-        )
+        conn_str = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+        connect_args = {}
+
+        ssl_ca_path = db_config.get("ssl_ca")
+        if ssl_ca_path:
+            cert_path = Path(__file__).resolve().parent.parent / ssl_ca_path
+            if cert_path.exists():
+                connect_args["ssl"] = {"ca": str(cert_path)}
+            else:
+                st.warning(f"SSL certificate not found at {cert_path}. Attempting connection without SSL.")
+
+        engine = create_engine(conn_str, connect_args=connect_args)
 
         student_master = pd.read_sql("SELECT * FROM student_master", engine)
         subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
