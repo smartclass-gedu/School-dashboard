@@ -6,3 +6,4 @@ scipy>=1.11
 statsmodels>=0.14
 sqlalchemy>=2.0
 pymysql>=1.1
+matplotlib
