@@ -285,6 +285,25 @@ def _load_from_database():
         student_master = pd.read_sql("SELECT * FROM student_master", engine)
         subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
 
+        # Rename database snake_case columns to match app's CSV-style column names
+        # so all three data sources (demo, CSV, database) produce identical schemas
+        student_master = student_master.rename(columns={
+            "year_group": "yearGroup",
+            "reg_group": "regGroup",
+            "current_pct": "current (%)",
+            "predicted_pct": "predicted (%)",
+            "teacher_target_pct": "teacherTarget (%)",
+            "attendance_pct": "Attendance (%)",
+            "prev_year_pct": "Previous year attainment (%)",
+        })
+        subject_term = subject_term.rename(columns={
+            "subject_name": "subjectName",
+            "teacher_name": "teacherName",
+            "sheet_percentage": "sheetPercentage",
+            "predicted_pct": "predicted (%)",
+            "teacher_target_pct": "teacherTarget (%)",
+        })
+
         engine.dispose()
         return student_master, subject_term
     except Exception as e:
