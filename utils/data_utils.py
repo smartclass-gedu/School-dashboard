@@ -353,12 +353,34 @@ def _make_engine(db_config):
 
 def _load_db_data(db_config):
     """Builds (student_master, subject_term) from a MySQL/MariaDB database.
-    db_config is st.secrets["db"] with host/port/user/password/database keys."""
+    db_config is st.secrets["db"] with host/port/user/password/database keys.
+
+    etl_to_mariadb.py writes these tables with snake_case columns (current_pct,
+    reg_group, year_group, subject_name, ...) to satisfy MySQL/Aiven's primary-key
+    and naming conventions. The rest of this app -- all four existing pages --
+    expects the original CSV-style names (current (%), regGroup, yearGroup,
+    subjectName, ...), so both tables need renaming right after the read, the
+    same way _load_db_benchmark() already does for external_benchmark."""
     engine = _make_engine(db_config)
 
     student_master = pd.read_sql("SELECT * FROM student_master", engine)
-    subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
+    student_master = student_master.rename(columns={
+        "current_pct": "current (%)", "predicted_pct": "predicted (%)",
+        "teacher_target_pct": "teacherTarget (%)", "reg_group": "regGroup",
+        "attendance_pct": "Attendance (%)", "prev_year_pct": "Previous year attainment (%)",
+        "year_group": "yearGroup",
+    })
 
+    subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
+    subject_term = subject_term.rename(columns={
+        "subject_name": "subjectName", "teacher_name": "teacherName",
+        "sheet_percentage": "sheetPercentage", "predicted_pct": "predicted (%)",
+        "teacher_target_pct": "teacherTarget (%)",
+    })
+
+    # recomputed fresh rather than trusting the DB's stored performance_band/at_risk,
+    # same as _load_real_data() -- keeps the tertile/quartile cuts consistent with
+    # whatever's actually in this student_master, not whatever was true at ETL time
     student_master["performance_band"] = pd.qcut(
         student_master["current (%)"], q=3, labels=["Low", "Medium", "High"]
     )
