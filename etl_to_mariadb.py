@@ -1,11 +1,13 @@
 """
 ETL: load the two real school CSVs into MariaDB/MySQL, producing the same
-student_master / subject_term tables the Streamlit dashboard already uses.
+student_master / subject_term / external_benchmark tables the Streamlit
+dashboard already uses.
 
 This intentionally duplicates the cleaning logic from
-school_dashboard/utils/data_utils.py's _load_real_data() -- same column
-mapping, same Summative-preferred-over-Continuous term extraction -- so
-Frappe Insights and the Streamlit app show identical numbers.
+school_dashboard/utils/data_utils.py's _load_real_data() / _load_real_benchmark()
+-- same column mapping, same Summative-preferred-over-Continuous term extraction,
+same CAT4 grade->percentage banding -- so Frappe Insights and the Streamlit app
+show identical numbers.
 
 Run this any time the source CSVs are updated to refresh the analytics DB.
 
@@ -36,7 +38,12 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "changeme123")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "3307"))   # 3307 matches local Docker; Aiven uses its own port
 DB_NAME = os.environ.get("DB_NAME", "school_analytics")
-DB_SSL_CA = os.environ.get("DB_SSL_CA")  # path to ca.pem relative to repo root (e.g. "certs/aiven-ca.pem") -- required for Aiven, unset for local Docker
+DB_SSL_CA = os.environ.get("DB_SSL_CA")  # path to ca.pem -- required for Aiven, unset for local Docker
+
+# CAT4 letter grade <-> the discrete externalTarget (%) banding it maps to in the
+# source file (A*=90, A=80, B=70, C=60, D=50, E=40, F=0) -- must match
+# utils/data_utils.py's CAT4_GRADE_TO_PCT exactly.
+CAT4_GRADE_TO_PCT = {"A*": 90, "A": 80, "B": 70, "C": 60, "D": 50, "E": 40, "F": 0}
 
 
 def _is_pct_col(s: pd.Series) -> bool:
@@ -106,15 +113,11 @@ def load_and_clean():
 
     sa = extract_term_rows("Summative Assessment", "Summative")
     ca = extract_term_rows("Continuous Assessment", "Continuous")
-
-    # Version-safe membership check (avoids merge + fillna(False) downcasting,
-    # which behaves differently across pandas versions and silently changed
-    # row counts between environments).
-    sa_pairs = set(zip(sa["UPN"], sa["subjectName"]))
+    has_summative = sa[["UPN", "subjectName"]].drop_duplicates()
+    has_summative["has_sa"] = True
     combined = pd.concat([sa, ca], ignore_index=True)
-    combined["has_sa"] = [
-        (upn, subj) in sa_pairs for upn, subj in zip(combined["UPN"], combined["subjectName"])
-    ]
+    combined = combined.merge(has_summative, on=["UPN", "subjectName"], how="left")
+    combined["has_sa"] = combined["has_sa"].fillna(False)
     subject_term = combined[(combined["source"] == "Summative") | (~combined["has_sa"])]
     subject_term = subject_term[
         ["UPN", "subjectName", "teacherName", "term", "sheetPercentage", "predicted (%)", "teacherTarget (%)"]
@@ -124,10 +127,24 @@ def load_and_clean():
         "teacherTarget (%)": "teacher_target_pct",
     }).copy()
 
-    return student_master, subject_term
+    # ---- external_benchmark: CAT4-derived external benchmark vs. internal grade,
+    # one row per (student, subject) -- KHDA grade-inflation audit view. Mirrors
+    # utils/data_utils.py's _load_real_benchmark() exactly. ----
+    bench_source = df1_letter.dropna(subset=["CAT4", "externalTarget (%)"])
+    external_benchmark = bench_source.groupby(["UPN", "subjectName"]).agg(
+        year_group=("yearGroup", "first"),
+        reg_group=("regGroup", "first"),
+        teacher_name=("teacherName", "first"),
+        cat4_grade=("CAT4", "first"),
+        external_pct=("externalTarget (%)", "first"),
+        internal_pct=("current (%)", "mean"),
+    ).reset_index().rename(columns={"subjectName": "subject_name"})
+    external_benchmark["gap_pp"] = external_benchmark["internal_pct"] - external_benchmark["external_pct"]
+
+    return student_master, subject_term, external_benchmark
 
 
-def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame):
+def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame, external_benchmark: pd.DataFrame):
     from sqlalchemy import create_engine, text
     conn_str = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -135,11 +152,7 @@ def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame):
     if DB_SSL_CA:
         # Aiven (and most managed MySQL/MariaDB hosts) require SSL. pymysql
         # expects the CA cert path nested under a "ssl" dict.
-        cert_path = Path(__file__).resolve().parent / DB_SSL_CA
-        if cert_path.exists():
-            connect_args["ssl"] = {"ca": str(cert_path)}
-        else:
-            print(f"Warning: SSL certificate not found at {cert_path}. Attempting connection without SSL.")
+        connect_args["ssl"] = {"ca": DB_SSL_CA}
 
     engine = create_engine(conn_str, connect_args=connect_args)
 
@@ -148,8 +161,8 @@ def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame):
 
     # Aiven (and most managed MySQL hosts) enforce sql_require_primary_key,
     # which pandas.to_sql's auto-created tables don't satisfy on their own.
-    # So: create both tables explicitly with a real PRIMARY KEY first, then
-    # append the data into them (rather than letting to_sql create the
+    # So: create all three tables explicitly with a real PRIMARY KEY first,
+    # then append the data into them (rather than letting to_sql create the
     # table itself).
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS student_master"))
@@ -184,16 +197,34 @@ def write_to_mariadb(student_master: pd.DataFrame, subject_term: pd.DataFrame):
             )
         """))
 
+        conn.execute(text("DROP TABLE IF EXISTS external_benchmark"))
+        conn.execute(text("""
+            CREATE TABLE external_benchmark (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                UPN VARCHAR(64),
+                subject_name TEXT,
+                year_group TEXT,
+                reg_group TEXT,
+                teacher_name TEXT,
+                cat4_grade VARCHAR(4),
+                external_pct DOUBLE,
+                internal_pct DOUBLE,
+                gap_pp DOUBLE
+            )
+        """))
+
     student_master.to_sql("student_master", engine, if_exists="append", index=False, chunksize=1000)
     subject_term.to_sql("subject_term", engine, if_exists="append", index=False, chunksize=1000)
+    external_benchmark.to_sql("external_benchmark", engine, if_exists="append", index=False, chunksize=1000)
 
     print(f"Wrote {len(student_master)} rows to student_master")
     print(f"Wrote {len(subject_term)} rows to subject_term")
+    print(f"Wrote {len(external_benchmark)} rows to external_benchmark")
 
 
 if __name__ == "__main__":
     print("Loading and cleaning CSVs...")
-    student_master, subject_term = load_and_clean()
+    student_master, subject_term, external_benchmark = load_and_clean()
     print("Writing to MariaDB...")
-    write_to_mariadb(student_master, subject_term)
+    write_to_mariadb(student_master, subject_term, external_benchmark)
     print("Done.")

@@ -82,6 +82,46 @@ def anova_across_groups(df: pd.DataFrame, group_col: str, value_col: str):
     return float(f_stat), float(p_val)
 
 
+def inflation_summary(benchmark_df: pd.DataFrame, threshold: float = 10.0) -> dict:
+    """Cohort-level summary of the CAT4-vs-internal gap. "gap (pp)" = internal -
+    external; positive means the internal grade runs ahead of what the CAT4
+    benchmark predicts -- the KHDA grade-inflation signal."""
+    clean = benchmark_df["gap (pp)"].dropna()
+    if len(clean) == 0:
+        return {"mean_gap": 0.0, "flagged_pct": 0.0, "flagged_n": 0, "n": 0}
+    flagged = clean > threshold
+    return {
+        "mean_gap": float(clean.mean()),
+        "flagged_pct": float(flagged.mean() * 100),
+        "flagged_n": int(flagged.sum()),
+        "n": int(len(clean)),
+    }
+
+
+def gap_by_subject(benchmark_df: pd.DataFrame, threshold: float = 10.0) -> pd.DataFrame:
+    """Mean gap, row count, and % flagged, one row per subject -- ranked
+    subject-level view for the alignment table, sorted most-inflated first."""
+    g = benchmark_df.groupby("subjectName")["gap (pp)"].agg(mean_gap="mean", n="count").reset_index()
+    flagged = benchmark_df.assign(flag=benchmark_df["gap (pp)"] > threshold).groupby("subjectName")["flag"].mean()
+    g["flagged_pct"] = g["subjectName"].map(flagged) * 100
+    return g.sort_values("mean_gap", ascending=False)
+
+
+def gap_by_teacher(benchmark_df: pd.DataFrame, threshold: float = 10.0) -> pd.DataFrame:
+    """Same as gap_by_subject but grouped by (subject, teacher) -- the level KHDA
+    audits actually operate at, since grade inflation is a marking-practice signal."""
+    g = benchmark_df.groupby(["subjectName", "teacherName"])["gap (pp)"].agg(
+        mean_gap="mean", n="count"
+    ).reset_index()
+    flagged = (
+        benchmark_df.assign(flag=benchmark_df["gap (pp)"] > threshold)
+        .groupby(["subjectName", "teacherName"])["flag"].mean()
+    )
+    g = g.set_index(["subjectName", "teacherName"])
+    g["flagged_pct"] = flagged * 100
+    return g.reset_index().sort_values("mean_gap", ascending=False)
+
+
 def summary_stats(series: pd.Series) -> dict:
     """Common descriptive stats bundle for a KPI panel."""
     clean = series.dropna()

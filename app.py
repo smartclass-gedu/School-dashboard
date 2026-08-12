@@ -6,7 +6,6 @@ sys.path.append(str(Path(__file__).resolve().parent))
 import streamlit as st
 
 from utils.styling import inject_css, page_header, callout
-from utils.data_utils import load_data
 
 st.set_page_config(
     page_title="School Insights",
@@ -29,6 +28,8 @@ Use the sidebar to pick a view:
 - **👩‍🏫 Teacher** — a teacher's own classes, growth, and calibration
 - **🎓 Student** — an individual student's own standing and trend
 - **👪 Parent** — the same as the student view, in plain language
+- **📐 Benchmark** — internal grades vs. the external CAT4 benchmark, for
+  KHDA-style grade-inflation review
 
 Each view pulls from the same underlying cleaned tables, so nothing is
 computed twice or differently between roles.
@@ -40,10 +41,3 @@ callout(
     "and <code>data/ReportExplorer_MASTER_ANON.csv</code> when present, falling back to "
     "synthetic demo data otherwise. Each page's caption tells you which one is active."
 )
-
-# DEBUG: Show data loading state
-student_master, subject_term, is_demo = load_data()
-st.write("DEBUG -- is_demo:", is_demo)
-st.write("DEBUG -- student_master columns:", student_master.columns.tolist())
-st.write("DEBUG -- subject_term columns:", subject_term.columns.tolist())
-st.write("DEBUG -- student_master shape:", student_master.shape)

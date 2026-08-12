@@ -15,15 +15,22 @@ import pandas as pd
 import re
 import streamlit as st
 from pathlib import Path
-from sqlalchemy import create_engine
+from urllib.parse import quote_plus
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = REPO_ROOT / "data"
 F1_PATH = DATA_DIR / "MSB_Private_School_2024-25_MASTER_ANON.csv"
 F2_PATH = DATA_DIR / "ReportExplorer_MASTER_ANON.csv"
 
 TERMS = ["T1", "T2", "T3"]
 SUBJECTS = ["Maths", "English", "Science", "Humanities", "Art", "PE"]
 YEAR_GROUPS = list(range(1, 12))  # Grade/Year 1 through 11
+
+# CAT4 letter grade <-> the discrete externalTarget (%) banding it maps to in the
+# source file (confirmed against the real data: A*=90, A=80, B=70, C=60, D=50,
+# E=40, F=0, with a small number of noisy E/F rows folded into the dominant band).
+CAT4_GRADE_TO_PCT = {"A*": 90, "A": 80, "B": 70, "C": 60, "D": 50, "E": 40, "F": 0}
+INFLATION_THRESHOLD_DEFAULT = 10  # pp; internal - external above this is flagged
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +129,54 @@ def _generate_demo_data(n_students: int = 300, seed: int = 42):
     return student_master, subject_term
 
 
+def _generate_demo_benchmark(student_master: pd.DataFrame, subject_term: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
+    """Synthetic CAT4-style external benchmark, built on top of the already-generated
+    demo student_master/subject_term so it stays consistent with the rest of the demo
+    dataset. Mirrors the real file's coverage pattern: only the oldest year groups
+    (proxy for the real data's Year 7-10-only CAT4 rollout) and roughly the same ~30%
+    of students. A subset of teachers get a deliberate positive bias baked in, so the
+    resulting chart actually has something to flag when reviewing the design."""
+    rng = np.random.default_rng(seed)
+
+    # per-(student, subject) internal % -- last recorded term score, same "current"
+    # concept the rest of the app uses
+    internal = (
+        subject_term.sort_values("term")
+        .groupby(["UPN", "subjectName"])
+        .agg(internal_pct=("sheetPercentage", "last"), teacherName=("teacherName", "last"))
+        .reset_index()
+    )
+
+    older_years = sorted(student_master["yearGroup"].unique())[-4:]  # proxy for "Year 7-10 only"
+    eligible = student_master[student_master["yearGroup"].isin(older_years)]["UPN"].unique()
+    eligible = pd.Series(eligible)
+    benchmarked_students = set(eligible[rng.random(len(eligible)) < 0.30])
+
+    bench = internal[internal["UPN"].isin(benchmarked_students)].copy()
+    if len(bench) == 0:
+        return bench.assign(yearGroup=[], regGroup=[], CAT4_grade=[], external_pct=[], **{"gap (pp)": []})
+
+    # deliberately-biased teachers, so the demo shows a mix of aligned and inflated rows
+    unique_teachers = pd.Series(sorted(bench["teacherName"].unique()))
+    biased_teachers = set(unique_teachers.sample(frac=0.2, random_state=seed))
+    bias = bench["teacherName"].isin(biased_teachers).map({True: 14, False: 0}).astype(float)
+
+    noise = rng.normal(0, 5, size=len(bench))
+    external_raw = (bench["internal_pct"].to_numpy() - bias.to_numpy() + noise).clip(0, 100)
+
+    bands = np.array(sorted(set(CAT4_GRADE_TO_PCT.values())))
+    nearest_idx = np.abs(external_raw[:, None] - bands[None, :]).argmin(axis=1)
+    external_pct = bands[nearest_idx]
+    pct_to_grade = {v: k for k, v in CAT4_GRADE_TO_PCT.items()}
+    bench["external_pct"] = external_pct
+    bench["CAT4_grade"] = [pct_to_grade[p] for p in external_pct]
+
+    bench = bench.merge(student_master[["UPN", "yearGroup", "regGroup"]], on="UPN", how="left")
+    bench["gap (pp)"] = bench["internal_pct"] - bench["external_pct"]
+    return bench[["UPN", "yearGroup", "regGroup", "subjectName", "teacherName",
+                  "CAT4_grade", "external_pct", "internal_pct", "gap (pp)"]]
+
+
 # ---------------------------------------------------------------------------
 # Real data loader -- mirrors notebook 3, sections 0.1 and 2.1 exactly:
 #   - current (%) / predicted (%) / teacherTarget (%) are CONSTANT per
@@ -214,15 +269,12 @@ def _load_real_data():
     sa = _extract_term_rows("Summative Assessment", "Summative")
     ca = _extract_term_rows("Continuous Assessment", "Continuous")
 
-    # Version-safe membership check (avoids merge + fillna(False) downcasting,
-    # which behaves inconsistently across pandas versions and can silently
-    # let duplicate Continuous rows slip through for students who have both
-    # assessment types for the same subject).
-    sa_pairs = set(zip(sa["UPN"], sa["subjectName"]))
+    has_summative = sa[["UPN", "subjectName"]].drop_duplicates()
+    has_summative["has_sa"] = True
+
     combined = pd.concat([sa, ca], ignore_index=True)
-    combined["has_sa"] = [
-        (upn, subj) in sa_pairs for upn, subj in zip(combined["UPN"], combined["subjectName"])
-    ]
+    combined = combined.merge(has_summative, on=["UPN", "subjectName"], how="left")
+    combined["has_sa"] = combined["has_sa"].fillna(False)
     # keep Summative rows outright, and Continuous rows only where that
     # (student, subject) pair has no Summative data at all
     subject_term = combined[(combined["source"] == "Summative") | (~combined["has_sa"])]
@@ -233,111 +285,145 @@ def _load_real_data():
     return student_master, subject_term
 
 
-# ---------------------------------------------------------------------------
-# Database loader -- reads from MySQL/MariaDB using credentials in st.secrets
-# ---------------------------------------------------------------------------
-def _load_from_database():
-    """
-    Reads student_master and subject_term from a MySQL/MariaDB database.
-    Expects st.secrets to have:
-      ["db"]["host"], ["port"], ["user"], ["password"], ["database"]
-    Optionally uses SSL (required for Aiven):
-      ["db"]["ssl_ca"] = relative path to CA certificate (e.g. "certs/aiven-ca.pem")
+def _load_real_benchmark() -> pd.DataFrame:
+    """CAT4-derived external benchmark vs. internal grade, one row per (student,
+    subject) -- the KHDA-relevant view: is the internal current (%) running ahead
+    of what the CAT4 cognitive-ability battery would predict?
 
-    Returns (student_master, subject_term) with the same schema as the real
-    and demo data loaders, ensuring seamless swaps between data sources.
-    """
-    secrets_paths = [
-        Path.home() / ".streamlit" / "secrets.toml",
-        Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml",
-    ]
-    if not any(p.exists() for p in secrets_paths):
-        return None, None
+    Reads F1_PATH directly rather than reusing _load_real_data()'s df1_letter,
+    since load_data() is a 3-tuple every existing page already unpacks and
+    threading a 4th value through it would touch all four pages for no reason.
+    CAT4 / externalTarget (%) are constant per (student, subject) -- same as
+    current (%) / predicted (%) / teacherTarget (%) -- confirmed against the
+    real file (max 1 distinct value per group)."""
+    needed = ["UPN", "yearGroup", "regGroup", "subjectName", "teacherName",
+              "CAT4", "externalTarget (%)", "current (%)"]
+    df = pd.read_csv(F1_PATH, usecols=lambda c: c in needed, low_memory=False)
+    df["UPN"] = df["UPN"].str.strip()
+    df = df.dropna(subset=["CAT4", "externalTarget (%)"])
 
+    bench = df.groupby(["UPN", "subjectName"]).agg(
+        yearGroup=("yearGroup", "first"),
+        regGroup=("regGroup", "first"),
+        teacherName=("teacherName", "first"),
+        CAT4_grade=("CAT4", "first"),
+        external_pct=("externalTarget (%)", "first"),
+        internal_pct=("current (%)", "mean"),
+    ).reset_index()
+    bench["gap (pp)"] = bench["internal_pct"] - bench["external_pct"]
+    return bench[["UPN", "yearGroup", "regGroup", "subjectName", "teacherName",
+                  "CAT4_grade", "external_pct", "internal_pct", "gap (pp)"]]
+
+
+def _get_db_secrets():
+    """Returns st.secrets["db"] if a [db] section is configured, else None.
+    Safe to call even when no secrets.toml exists at all (local dev)."""
     try:
-        db_config = st.secrets["db"]
-    except (KeyError, AttributeError, FileNotFoundError):
-        return None, None
-
-    host = db_config.get("host")
-    port = db_config.get("port", 3306)
-    user = db_config.get("user")
-    password = db_config.get("password")
-    database = db_config.get("database")
-
-    if not all([host, user, password, database]):
-        return None, None
-
-    try:
-        conn_str = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-        connect_args = {}
-
-        ssl_ca_path = db_config.get("ssl_ca")
-        if ssl_ca_path:
-            cert_path = Path(__file__).resolve().parent.parent / ssl_ca_path
-            if cert_path.exists():
-                connect_args["ssl"] = {"ca": str(cert_path)}
-            else:
-                st.warning(f"SSL certificate not found at {cert_path}. Attempting connection without SSL.")
-
-        engine = create_engine(conn_str, connect_args=connect_args)
-
-        student_master = pd.read_sql("SELECT * FROM student_master", engine)
-        subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
-
-        # DEBUG: Print raw DB column names before renaming
-        print("RAW DB COLUMNS student_master:", student_master.columns.tolist())
-        print("RAW DB COLUMNS subject_term:", subject_term.columns.tolist())
-
-        # Rename database snake_case columns to match app's CSV-style column names
-        # so all three data sources (demo, CSV, database) produce identical schemas
-        student_master = student_master.rename(columns={
-            "year_group": "yearGroup",
-            "reg_group": "regGroup",
-            "current_pct": "current (%)",
-            "predicted_pct": "predicted (%)",
-            "teacher_target_pct": "teacherTarget (%)",
-            "attendance_pct": "Attendance (%)",
-            "prev_year_pct": "Previous year attainment (%)",
-        })
-        subject_term = subject_term.rename(columns={
-            "subject_name": "subjectName",
-            "teacher_name": "teacherName",
-            "sheet_percentage": "sheetPercentage",
-            "predicted_pct": "predicted (%)",
-            "teacher_target_pct": "teacherTarget (%)",
-        })
-
-        engine.dispose()
-        return student_master, subject_term
-    except Exception as e:
-        st.warning(f"Database connection failed: {e}")
-        return None, None
+        if "db" in st.secrets:
+            return st.secrets["db"]
+    except Exception:
+        pass
+    return None
 
 
-# TEMPORARILY DISABLED FOR DEBUGGING: @st.cache_data
+def _make_engine(db_config):
+    """Builds the SQLAlchemy engine used by both the student/subject loader and
+    the benchmark loader. Mirrors etl_to_mariadb.py's SSL handling: if db_config
+    has an ssl_ca entry (as documented in .streamlit/secrets.toml.example for
+    Aiven and most other managed MySQL/MariaDB hosts, which enforce SSL),
+    resolve it relative to the repo root and pass it through connect_args --
+    without this, a plain connection string to a host that requires SSL just
+    fails to connect."""
+    from sqlalchemy import create_engine
+    url = (
+        f"mysql+pymysql://{db_config['user']}:{quote_plus(db_config['password'])}"
+        f"@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+    )
+
+    connect_args = {}
+    ssl_ca = db_config.get("ssl_ca") if hasattr(db_config, "get") else None
+    if ssl_ca:
+        ssl_ca_path = Path(ssl_ca)
+        if not ssl_ca_path.is_absolute():
+            ssl_ca_path = REPO_ROOT / ssl_ca_path
+        connect_args["ssl"] = {"ca": str(ssl_ca_path)}
+
+    return create_engine(url, connect_args=connect_args)
+
+
+def _load_db_data(db_config):
+    """Builds (student_master, subject_term) from a MySQL/MariaDB database.
+    db_config is st.secrets["db"] with host/port/user/password/database keys."""
+    engine = _make_engine(db_config)
+
+    student_master = pd.read_sql("SELECT * FROM student_master", engine)
+    subject_term = pd.read_sql("SELECT * FROM subject_term", engine)
+
+    student_master["performance_band"] = pd.qcut(
+        student_master["current (%)"], q=3, labels=["Low", "Medium", "High"]
+    )
+    risk_cutoff = student_master["current (%)"].quantile(0.25)
+    student_master["at_risk"] = student_master["current (%)"] <= risk_cutoff
+
+    return student_master, subject_term
+
+
+def _load_db_benchmark(db_config) -> pd.DataFrame:
+    """Reads the external_benchmark table written by etl_to_mariadb.py and renames
+    its snake_case columns back to the naming convention the rest of this app uses."""
+    engine = _make_engine(db_config)
+    bench = pd.read_sql("SELECT * FROM external_benchmark", engine)
+    return bench.rename(columns={
+        "year_group": "yearGroup", "reg_group": "regGroup",
+        "subject_name": "subjectName", "teacher_name": "teacherName",
+        "cat4_grade": "CAT4_grade", "gap_pp": "gap (pp)",
+    })
+
+
+@st.cache_data(ttl=600)
 def load_data():
     """
     Returns (student_master, subject_term, is_demo).
-    Priority order:
-      1. If st.secrets["db"] exists, connect to that database and use it
-      2. Else if local CSV files exist, use those (real data mode)
-      3. Else fall back to synthetic demo data
+    Priority: MySQL/MariaDB via st.secrets["db"] > local CSVs in data/ > synthetic demo data.
     """
-    # Try database first
-    student_master, subject_term = _load_from_database()
-    if student_master is not None and subject_term is not None:
+    db_config = _get_db_secrets()
+    if db_config is not None:
+        student_master, subject_term = _load_db_data(db_config)
         return student_master, subject_term, False
 
-    # Fall back to local CSV files
     if F1_PATH.exists() and F2_PATH.exists():
         student_master, subject_term = _load_real_data()
         return student_master, subject_term, False
 
-    # Final fallback to synthetic demo data
     student_master, subject_term = _generate_demo_data()
     return student_master, subject_term, True
 
+
+@st.cache_data(ttl=600)
+def load_benchmark_data():
+    """
+    Returns (external_benchmark, is_demo) -- the CAT4-vs-internal-grade table behind
+    the Benchmark page. Same source priority as load_data(), kept as a separate
+    function so the four existing pages (which all unpack load_data() as a 3-tuple)
+    don't need to change.
+
+    Columns: UPN, yearGroup, regGroup, subjectName, teacherName, CAT4_grade,
+    external_pct, internal_pct, "gap (pp)" (= internal_pct - external_pct; positive
+    means the internal grade is running ahead of the CAT4-predicted grade -- the
+    grade-inflation signal KHDA inspectors look for).
+    """
+    db_config = _get_db_secrets()
+    if db_config is not None:
+        try:
+            return _load_db_benchmark(db_config), False
+        except Exception:
+            pass  # table not migrated yet on this DB -- fall through to CSV/demo
+
+    if F1_PATH.exists():
+        return _load_real_benchmark(), False
+
+    student_master, subject_term = _generate_demo_data()
+    return _generate_demo_benchmark(student_master, subject_term), True
 
 
 def band_label(pct_rank: float) -> str:
